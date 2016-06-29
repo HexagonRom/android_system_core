@@ -10,8 +10,7 @@ import /init.${ro.hardware}.rc
 import /init.usb.configfs.rc
 import /init.${ro.zygote}.rc
 import /init.trace.rc
-# Include AICP's extra init file
-import /init.aicp.rc
+import /init.hexagon.rc
 
 
 on early-init
