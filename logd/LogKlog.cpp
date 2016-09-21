@@ -20,13 +20,16 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/uio.h>
 #include <syslog.h>
 
 #include <log/logger.h>
 
+#include "LogBuffer.h"
 #include "LogKlog.h"
+#include "LogReader.h"
 
 #define KMSG_PRIORITY(PRI)           \
     '<',                             \
@@ -206,7 +209,10 @@ char *log_strntok_r(char *s, size_t *len, char **last, size_t *sublen) {
     // NOTREACHED
 }
 
-log_time LogKlog::correction = log_time(CLOCK_REALTIME) - log_time(CLOCK_MONOTONIC);
+log_time LogKlog::correction =
+    (log_time(CLOCK_REALTIME) < log_time(CLOCK_MONOTONIC))
+        ? log_time::EPOCH
+        : (log_time(CLOCK_REALTIME) - log_time(CLOCK_MONOTONIC));
 
 LogKlog::LogKlog(LogBuffer *buf, LogReader *reader, int fdWrite, int fdRead, bool auditd) :
         SocketListener(fdRead, false),
@@ -272,7 +278,7 @@ void LogKlog::calculateCorrection(const log_time &monotonic,
                                   size_t len) {
     log_time real;
     const char *ep = real.strptime(real_string, "%Y-%m-%d %H:%M:%S.%09q UTC");
-    if (!ep || (ep > &real_string[len])) {
+    if (!ep || (ep > &real_string[len]) || (real > log_time(CLOCK_REALTIME))) {
         return;
     }
     // kernel report UTC, log_time::strptime is localtime from calendar.
@@ -283,8 +289,16 @@ void LogKlog::calculateCorrection(const log_time &monotonic,
     memset(&tm, 0, sizeof(tm));
     tm.tm_isdst = -1;
     localtime_r(&now, &tm);
-    real.tv_sec += tm.tm_gmtoff;
-    correction = real - monotonic;
+    if ((tm.tm_gmtoff < 0) && ((-tm.tm_gmtoff) > (long)real.tv_sec)) {
+        real = log_time::EPOCH;
+    } else {
+        real.tv_sec += tm.tm_gmtoff;
+    }
+    if (monotonic > real) {
+        correction = log_time::EPOCH;
+    } else {
+        correction = real - monotonic;
+    }
 }
 
 static const char suspendStr[] = "PM: suspend entry ";
@@ -319,16 +333,20 @@ void LogKlog::sniffTime(log_time &now,
     if (cp && (cp >= &(*buf)[len])) {
         cp = NULL;
     }
-    len -= cp - *buf;
     if (cp) {
         static const char healthd[] = "healthd";
         static const char battery[] = ": battery ";
 
+        len -= cp - *buf;
         if (len && isspace(*cp)) {
             ++cp;
             --len;
         }
         *buf = cp;
+
+        if (isMonotonic()) {
+            return;
+        }
 
         const char *b;
         if (((b = strnstr(cp, len, suspendStr)))
@@ -343,16 +361,11 @@ void LogKlog::sniffTime(log_time &now,
                 && ((size_t)((b += sizeof(healthd) - 1) - cp) < len)
                 && ((b = strnstr(b, len -= b - cp, battery)))
                 && ((size_t)((b += sizeof(battery) - 1) - cp) < len)) {
-            len -= b - cp;
-            // NB: healthd is roughly 150us late, worth the price to deal with
-            //     ntp-induced or hardware clock drift.
-            // look for " 2???-??-?? ??:??:??.????????? ???"
-            for (; len && *b && (*b != '\n'); ++b, --len) {
-                if ((b[0] == ' ') && (b[1] == '2') && (b[5] == '-')) {
-                    calculateCorrection(now, b + 1, len - 1);
-                    break;
-                }
-            }
+            // NB: healthd is roughly 150us late, so we use it instead to
+            //     trigger a check for ntp-induced or hardware clock drift.
+            log_time real(CLOCK_REALTIME);
+            log_time mono(CLOCK_MONOTONIC);
+            correction = (real < mono) ? log_time::EPOCH : (real - mono);
         } else if (((b = strnstr(cp, len, suspendedStr)))
                 && ((size_t)((b += sizeof(suspendStr) - 1) - cp) < len)) {
             len -= b - cp;
@@ -367,7 +380,11 @@ void LogKlog::sniffTime(log_time &now,
                     real.tv_nsec += (*endp - '0') * multiplier;
                 }
                 if (reverse) {
-                    correction -= real;
+                    if (real > correction) {
+                        correction = log_time::EPOCH;
+                    } else {
+                        correction -= real;
+                    }
                 } else {
                     correction += real;
                 }
@@ -376,7 +393,11 @@ void LogKlog::sniffTime(log_time &now,
 
         convertMonotonicToReal(now);
     } else {
-        now = log_time(CLOCK_REALTIME);
+        if (isMonotonic()) {
+            now = log_time(CLOCK_MONOTONIC);
+        } else {
+            now = log_time(CLOCK_REALTIME);
+        }
     }
 }
 
@@ -574,7 +595,7 @@ int LogKlog::log(const char *buf, size_t len) {
     // Some may view the following as an ugly heuristic, the desire is to
     // beautify the kernel logs into an Android Logging format; the goal is
     // admirable but costly.
-    while ((isspace(*p) || !*p) && (p < &buf[len])) {
+    while ((p < &buf[len]) && (isspace(*p) || !*p)) {
         ++p;
     }
     if (p >= &buf[len]) { // timestamp, no content
@@ -588,7 +609,7 @@ int LogKlog::log(const char *buf, size_t len) {
         const char *bt, *et, *cp;
 
         bt = p;
-        if (!fast<strncmp>(p, "[INFO]", 6)) {
+        if ((taglen >= 6) && !fast<strncmp>(p, "[INFO]", 6)) {
             // <PRI>[<TIME>] "[INFO]"<tag> ":" message
             bt = p + 6;
             taglen -= 6;
@@ -612,7 +633,9 @@ int LogKlog::log(const char *buf, size_t len) {
             p = cp + 1;
         } else if (taglen) {
             size = et - bt;
-            if ((*bt == *cp) && fast<strncmp>(bt + 1, cp + 1, size - 1)) {
+            if ((taglen > size) &&   // enough space for match plus trailing :
+                    (*bt == *cp) &&  // ubber fast<strncmp> pair
+                    fast<strncmp>(bt + 1, cp + 1, size - 1)) {
                 // <PRI>[<TIME>] <tag>_host '<tag>.<num>' : message
                 if (!fast<strncmp>(bt + size - 5, "_host", 5)
                         && !fast<strncmp>(bt + 1, cp + 1, size - 6)) {
@@ -686,7 +709,7 @@ int LogKlog::log(const char *buf, size_t len) {
                     p = cp + 1;
                 }
             }
-        }
+        } /* else no tag */
         size = etag - tag;
         if ((size <= 1)
             // register names like x9
@@ -713,8 +736,12 @@ int LogKlog::log(const char *buf, size_t len) {
             taglen = mp - tag;
         }
     }
+    // Deal with sloppy and simplistic harmless p = cp + 1 etc above.
+    if (len < (size_t)(p - buf)) {
+        p = &buf[len];
+    }
     // skip leading space
-    while ((isspace(*p) || !*p) && (p < &buf[len])) {
+    while ((p < &buf[len]) && (isspace(*p) || !*p)) {
         ++p;
     }
     // truncate trailing space or nuls
@@ -727,16 +754,26 @@ int LogKlog::log(const char *buf, size_t len) {
         p = " ";
         b = 1;
     }
+    // paranoid sanity check, can not happen ...
     if (b > LOGGER_ENTRY_MAX_PAYLOAD) {
         b = LOGGER_ENTRY_MAX_PAYLOAD;
     }
+    if (taglen > LOGGER_ENTRY_MAX_PAYLOAD) {
+        taglen = LOGGER_ENTRY_MAX_PAYLOAD;
+    }
+    // calculate buffer copy requirements
     size_t n = 1 + taglen + 1 + b + 1;
-    int rc = n;
-    if ((taglen > n) || (b > n)) { // Can not happen ...
-        rc = -EINVAL;
-        return rc;
+    // paranoid sanity check, first two just can not happen ...
+    if ((taglen > n) || (b > n) || (n > USHRT_MAX)) {
+        return -EINVAL;
     }
 
+    // Careful.
+    // We are using the stack to house the log buffer for speed reasons.
+    // If we malloc'd this buffer, we could get away without n's USHRT_MAX
+    // test above, but we would then required a max(n, USHRT_MAX) as
+    // truncating length argument to logbuf->log() below. Gain is protection
+    // of stack sanity and speedup, loss is truncated long-line content.
     char newstr[n];
     char *np = newstr;
 
@@ -754,9 +791,34 @@ int LogKlog::log(const char *buf, size_t len) {
     memcpy(np, p, b);
     np[b] = '\0';
 
+    if (!isMonotonic()) {
+        // Watch out for singular race conditions with timezone causing near
+        // integer quarter-hour jumps in the time and compensate accordingly.
+        // Entries will be temporal within near_seconds * 2. b/21868540
+        static uint32_t vote_time[3];
+        vote_time[2] = vote_time[1];
+        vote_time[1] = vote_time[0];
+        vote_time[0] = now.tv_sec;
+
+        if (vote_time[1] && vote_time[2]) {
+            static const unsigned near_seconds = 10;
+            static const unsigned timezones_seconds = 900;
+            int diff0 = (vote_time[0] - vote_time[1]) / near_seconds;
+            unsigned abs0 = (diff0 < 0) ? -diff0 : diff0;
+            int diff1 = (vote_time[1] - vote_time[2]) / near_seconds;
+            unsigned abs1 = (diff1 < 0) ? -diff1 : diff1;
+            if ((abs1 <= 1) && // last two were in agreement on timezone
+                    ((abs0 + 1) % (timezones_seconds / near_seconds)) <= 2) {
+                abs0 = (abs0 + 1) / (timezones_seconds / near_seconds) *
+                                     timezones_seconds;
+                now.tv_sec -= (diff0 < 0) ? -abs0 : abs0;
+            }
+        }
+    }
+
     // Log message
-    rc = logbuf->log(LOG_ID_KERNEL, now, uid, pid, tid, newstr,
-                     (n <= USHRT_MAX) ? (unsigned short) n : USHRT_MAX);
+    int rc = logbuf->log(LOG_ID_KERNEL, now, uid, pid, tid, newstr,
+                         (unsigned short) n);
 
     // notify readers
     if (!rc) {

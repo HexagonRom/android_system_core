@@ -40,6 +40,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 
+#include <android-base/file.h>
 #include <cutils/list.h>
 #include <cutils/uevent.h>
 
@@ -48,7 +49,6 @@
 #include "util.h"
 #include "log.h"
 #include "property_service.h"
-#include <zlib.h>
 
 #define SYSFS_PREFIX    "/sys"
 static const char *firmware_dirs[] = { "/etc/firmware",
@@ -57,7 +57,7 @@ static const char *firmware_dirs[] = { "/etc/firmware",
 
 extern struct selabel_handle *sehandle;
 
-extern char boot_device[PROP_VALUE_MAX];
+extern std::string boot_device;
 
 static int device_fd = -1;
 
@@ -245,10 +245,12 @@ static void make_device(const char *path,
 
     mode = get_device_perm(path, links, &uid, &gid) | (block ? S_IFBLK : S_IFCHR);
 
-    if (sehandle) {
-        selabel_lookup_best_match(sehandle, &secontext, path, links, mode);
-        setfscreatecon(secontext);
+    if (selabel_lookup_best_match(sehandle, &secontext, path, links, mode)) {
+        ERROR("Device '%s' not created; cannot find SELinux label (%s)\n",
+                path, strerror(errno));
+        return;
     }
+    setfscreatecon(secontext);
 
     dev = makedev(major, minor);
     /* Temporarily change egid to avoid race condition setting the gid of the
@@ -257,14 +259,19 @@ static void make_device(const char *path,
      * racy. Fixing the gid race at least fixed the issue with system_server
      * opening dynamic input devices under the AID_INPUT gid. */
     setegid(gid);
-    mknod(path, mode, dev);
+    /* If the node already exists update its SELinux label to handle cases when
+     * it was created with the wrong context during coldboot procedure. */
+    if (mknod(path, mode, dev) && (errno == EEXIST)) {
+        if (lsetfilecon(path, secontext)) {
+            ERROR("Cannot set '%s' SELinux label on '%s' device (%s)\n",
+                    secontext, path, strerror(errno));
+        }
+    }
     chown(path, uid, -1);
     setegid(AID_ROOT);
 
-    if (secontext) {
-        freecon(secontext);
-        setfscreatecon(NULL);
-    }
+    freecon(secontext);
+    setfscreatecon(NULL);
 }
 
 static void add_platform_device(const char *path)
@@ -557,7 +564,7 @@ static char **get_block_device_symlinks(struct uevent *uevent)
         free(p);
     }
 
-    if (pdev && boot_device[0] != '\0' && strstr(device, boot_device)) {
+    if (pdev && boot_device.c_str()[0] != '\0' && strstr(device, boot_device.c_str())) {
         make_link_init(link_path, "/dev/block/bootdevice");
         is_bootdevice = 1;
     } else {
@@ -808,8 +815,30 @@ static void handle_generic_device_event(struct uevent *uevent)
          base = "/dev/log/";
          make_dir(base, 0755);
          name += 4;
-     } else
-         base = "/dev/";
+     } else if (!strncmp(uevent->subsystem, "dvb", 3)) {
+         /* This imitates the file system that would be created
+          * if we were using devfs instead to preserve backward compatibility
+          * for users of dvb devices
+          */
+         int adapter_id=0;
+         char dev_name[20] = {0};
+
+         sscanf(name, "dvb%d.%s", &adapter_id, dev_name);
+
+         /* build dvb directory */
+         base = "/dev/dvb";
+         mkdir(base, 0755);
+
+         /* build adapter directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d", adapter_id);
+         mkdir(devpath, 0755);
+
+         /* build actual device directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d/%s",
+                 adapter_id, dev_name);
+     }
+     else
+        base = "/dev/";
      links = get_character_device_symlinks(uevent);
 
      if (!devpath[0])
@@ -833,46 +862,55 @@ static void handle_device_event(struct uevent *uevent)
     }
 }
 
-static int load_firmware(int fw_fd, gzFile gz_fd, int loading_fd, int data_fd)
+static int load_firmware(int fw_fd, int loading_fd, int data_fd)
 {
+    struct stat st;
+    long len_to_copy;
     int ret = 0;
 
+    if(fstat(fw_fd, &st) < 0)
+        return -1;
+    len_to_copy = st.st_size;
+
+    if (S_ISBLK(st.st_mode)) {
+        //File points to a block device. Need to calculate it's size
+        //manually
+        len_to_copy = lseek64(fw_fd, 0, SEEK_END);
+        if (len_to_copy < 0) {
+            ERROR("Failed to get size of blk device partition: %s\n",
+                             strerror(errno));
+            return -1;
+        }
+        if (lseek64(fw_fd, 0, SEEK_SET) < 0) {
+            ERROR("Failed to set r/w offset for blk device partition: %s\n",
+                             strerror(errno));
+            return -1;
+        }
+    }
     write(loading_fd, "1", 1);  /* start transfer */
 
-    while (1) {
+    while (len_to_copy > 0) {
         char buf[PAGE_SIZE];
         ssize_t nr;
 
-        if (gz_fd)
-            nr = gzread(gz_fd, buf, sizeof(buf));
-        else
-            nr = read(fw_fd, buf, sizeof(buf));
+        nr = read(fw_fd, buf, sizeof(buf));
         if(!nr)
             break;
         if(nr < 0) {
             ret = -1;
             break;
         }
-
-        while (nr > 0) {
-            ssize_t nw = 0;
-
-            nw = write(data_fd, buf + nw, nr);
-            if(nw <= 0) {
-                ret = -1;
-                goto out;
-            }
-            nr -= nw;
+        if (!android::base::WriteFully(data_fd, buf, nr)) {
+            ret = -1;
+            break;
         }
+        len_to_copy -= nr;
     }
 
-out:
     if(!ret)
         write(loading_fd, "0", 1);  /* successful end of transfer */
-    else {
-        ERROR("%s: aborted transfer\n", __func__);
+    else
         write(loading_fd, "-1", 2); /* abort transfer */
-    }
 
     return ret;
 }
@@ -882,29 +920,12 @@ static int is_booting(void)
     return access("/dev/.booting", F_OK) == 0;
 }
 
-gzFile fw_gzopen(const char *fname, const char *mode)
-{
-    char *file1 = NULL;
-    int l;
-    gzFile gz_fd = NULL;
-
-    l = asprintf(&file1, "%s.gz",  fname);
-    if (l == -1)
-        goto out;
-
-    gz_fd = gzopen(file1, mode);
-    free(file1);
-out:
-    return gz_fd;
-}
-
 static void process_firmware_event(struct uevent *uevent)
 {
     char *root, *loading, *data;
     int l, loading_fd, data_fd, fw_fd;
     size_t i;
     int booting = is_booting();
-    gzFile gz_fd = NULL;
 
     INFO("firmware: loading '%s' for '%s'\n",
          uevent->firmware, uevent->path);
@@ -937,18 +958,15 @@ try_loading_again:
             goto data_free_out;
         fw_fd = open(file, O_RDONLY|O_CLOEXEC);
         free(file);
-        if (fw_fd < 0){
-            gz_fd = fw_gzopen(file, "rb");
-        }
-        if (fw_fd >= 0 || gz_fd) {
-            if(!load_firmware(fw_fd, gz_fd, loading_fd, data_fd))
+        if (fw_fd >= 0) {
+            if(!load_firmware(fw_fd, loading_fd, data_fd))
                 INFO("firmware: copy success { '%s', '%s' }\n", root, uevent->firmware);
             else
                 INFO("firmware: copy failure { '%s', '%s' }\n", root, uevent->firmware);
             break;
         }
     }
-    if ((fw_fd < 0) && !gz_fd) {
+    if (fw_fd < 0) {
         if (booting) {
             /* If we're not fully booted, we may be missing
              * filesystems needed for firmware, wait and retry.
@@ -962,10 +980,7 @@ try_loading_again:
         goto data_close_out;
     }
 
-    if (gz_fd)
-        gzclose(gz_fd);
-    else
-        close(fw_fd);
+    close(fw_fd);
 data_close_out:
     close(data_fd);
 loading_close_out:
@@ -1013,7 +1028,7 @@ void handle_device_fd()
         struct uevent uevent;
         parse_event(msg, &uevent);
 
-        if (sehandle && selinux_status_updated() > 0) {
+        if (selinux_status_updated() > 0) {
             struct selabel_handle *sehandle2;
             sehandle2 = selinux_android_file_context_handle();
             if (sehandle2) {
@@ -1080,11 +1095,8 @@ static void coldboot(const char *path)
 }
 
 void device_init() {
-    sehandle = NULL;
-    if (is_selinux_enabled() > 0) {
-        sehandle = selinux_android_file_context_handle();
-        selinux_status_open(true);
-    }
+    sehandle = selinux_android_file_context_handle();
+    selinux_status_open(true);
 
     /* is 256K enough? udev uses 16MB! */
     device_fd = uevent_open_socket(256*1024, true);

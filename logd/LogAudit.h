@@ -18,7 +18,10 @@
 #define _LOGD_LOG_AUDIT_H__
 
 #include <sysutils/SocketListener.h>
-#include "LogReader.h"
+
+#include "LogBuffer.h"
+
+class LogReader;
 
 class LogAudit : public SocketListener {
     LogBuffer *logbuf;
@@ -29,6 +32,7 @@ class LogAudit : public SocketListener {
 public:
     LogAudit(LogBuffer *buf, LogReader *reader, int fdDmesg);
     int log(char *buf, size_t len);
+    bool isMonotonic() { return logbuf->isMonotonic(); }
 
 protected:
     virtual bool onDataAvailable(SocketClient *cli);

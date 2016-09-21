@@ -37,7 +37,7 @@ static inline SchedPolicy _policy(SchedPolicy p)
    return p == SP_DEFAULT ? SP_SYSTEM_DEFAULT : p;
 }
 
-#if defined(HAVE_ANDROID_OS)
+#if defined(__ANDROID__)
 
 #include <pthread.h>
 #include <sched.h>
@@ -53,24 +53,32 @@ static inline SchedPolicy _policy(SchedPolicy p)
 #define TIMER_SLACK_FG 50000
 
 static pthread_once_t the_once = PTHREAD_ONCE_INIT;
-static pthread_once_t sched_once = PTHREAD_ONCE_INIT;
-static pthread_once_t cpuset_once = PTHREAD_ONCE_INIT;
 
 static int __sys_supports_schedgroups = -1;
-static int __sys_supports_cpusets = -1;
-static char proc_name[32] = {0};
 
 // File descriptors open to /dev/cpuctl/../tasks, setup by initialize, or -1 on error.
 static int bg_cgroup_fd = -1;
 static int fg_cgroup_fd = -1;
 
+#ifdef USE_CPUSETS
 // File descriptors open to /dev/cpuset/../tasks, setup by initialize, or -1 on error
 static int system_bg_cpuset_fd = -1;
 static int bg_cpuset_fd = -1;
 static int fg_cpuset_fd = -1;
+static int ta_cpuset_fd = -1; // special cpuset for top app
+static int bg_schedboost_fd = -1;
+static int fg_schedboost_fd = -1;
+#endif
 
-static int write_tid_to_fd(int tid, int fd)
+/* Add tid to the scheduling group defined by the policy */
+static int add_tid_to_cgroup(int tid, int fd)
 {
+    if (fd < 0) {
+        SLOGE("add_tid_to_cgroup failed; fd=%d\n", fd);
+        errno = EINVAL;
+        return -1;
+    }
+
     // specialized itoa -- works for tid > 0
     char text[22];
     char *end = text + sizeof(text) - 1;
@@ -88,42 +96,8 @@ static int write_tid_to_fd(int tid, int fd)
          */
         if (errno == ESRCH)
                 return 0;
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Add tid to the scheduling group defined by the policy */
-static int add_tid_to_cgroup(int tid, int fd)
-{
-    if (fd < 0) {
-        SLOGE("%s add_tid_to_cgroup failed; fd=%d\n", proc_name, fd);
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (write_tid_to_fd(tid, fd) != 0) {
-        SLOGW("%s add_tid_to_cgroup failed to write '%d' (%s); fd=%d\n",
-              proc_name, tid, strerror(errno), fd);
-        errno = EINVAL;
-        return -1;
-    }
-
-    return 0;
-}
-
-static int add_tid_to_cpuset(int tid, int fd)
-{
-    if (fd < 0) {
-        SLOGE("%s add_tid_to_cpuset failed; fd=%d\n", proc_name, fd);
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (write_tid_to_fd(tid, fd) != 0) {
-        SLOGW("%s add_tid_to_cpuset failed to write '%d' (%s); fd=%d\n",
-              proc_name, tid, strerror(errno), fd);
+        SLOGW("add_tid_to_cgroup failed to write '%s' (%s); fd=%d\n",
+              ptr, strerror(errno), fd);
         errno = EINVAL;
         return -1;
     }
@@ -132,102 +106,49 @@ static int add_tid_to_cpuset(int tid, int fd)
 }
 
 static void __initialize(void) {
-    int pfd;
-    int ptid = gettid();
-
-    sprintf(proc_name, "/proc/%d/cmdline", ptid);
-
-    pfd = open(proc_name, O_RDONLY);
-    memset(proc_name, 0, sizeof(proc_name));
-    if (pfd > 0) {
-        read(pfd, proc_name, sizeof(proc_name) - 1);
-        close(pfd);
-    }
-}
-
-static void __init_sched(void) {
     char* filename;
-
-    pthread_once(&the_once, __initialize);
-
     if (!access("/dev/cpuctl/tasks", F_OK)) {
         __sys_supports_schedgroups = 1;
 
         filename = "/dev/cpuctl/tasks";
         fg_cgroup_fd = open(filename, O_WRONLY | O_CLOEXEC);
         if (fg_cgroup_fd < 0) {
-            SLOGE("%s open of %s failed: %s\n", proc_name, filename, strerror(errno));
-            __sys_supports_schedgroups = 0;
+            SLOGE("open of %s failed: %s\n", filename, strerror(errno));
         }
 
         filename = "/dev/cpuctl/bg_non_interactive/tasks";
         bg_cgroup_fd = open(filename, O_WRONLY | O_CLOEXEC);
         if (bg_cgroup_fd < 0) {
-            SLOGE("%s open of %s failed: %s\n", proc_name, filename, strerror(errno));
-            __sys_supports_schedgroups = 0;
-        }
-
-        if (!__sys_supports_schedgroups) {
-            close(bg_cgroup_fd);
-            bg_cgroup_fd = -1;
-
-            close(fg_cgroup_fd);
-            fg_cgroup_fd = -1;
+            SLOGE("open of %s failed: %s\n", filename, strerror(errno));
         }
     } else {
         __sys_supports_schedgroups = 0;
     }
-}
-
-static void __init_cpuset(void) {
-    char *filename;
-
-    pthread_once(&the_once, __initialize);
 
 #ifdef USE_CPUSETS
     if (!access("/dev/cpuset/tasks", F_OK)) {
-        __sys_supports_cpusets = 1;
 
         filename = "/dev/cpuset/foreground/tasks";
         fg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        if (fg_cpuset_fd < 0) {
-            SLOGE("%s open of %s failed %s\n", proc_name, filename, strerror(errno));
-            __sys_supports_cpusets = 0;
-        }
-
         filename = "/dev/cpuset/background/tasks";
         bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        if (bg_cpuset_fd < 0) {
-            SLOGE("%s open of %s failed %s\n", proc_name, filename, strerror(errno));
-            __sys_supports_cpusets = 0;
-        }
-
         filename = "/dev/cpuset/system-background/tasks";
         system_bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        if (system_bg_cpuset_fd < 0) {
-            SLOGE("%s open of %s failed %s\n", proc_name, filename, strerror(errno));
-            __sys_supports_cpusets = 0;
-        }
+        filename = "/dev/cpuset/top-app/tasks";
+        ta_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
 
-        if (!__sys_supports_cpusets) {
-            close(fg_cpuset_fd);
-            fg_cpuset_fd = -1;
-
-            close(bg_cpuset_fd);
-            bg_cpuset_fd = -1;
-
-            close(system_bg_cpuset_fd);
-            system_bg_cpuset_fd = -1;
-        }
-    } else {
-        __sys_supports_cpusets = 0;
+#ifdef USE_SCHEDBOOST
+        filename = "/dev/stune/foreground/tasks";
+        fg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
+        filename = "/dev/stune/tasks";
+        bg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
+#endif
     }
 #endif
-
 }
 
 /*
- * Try to get the scheduler group.
+ * Returns the path under the requested cgroup subsystem (if it exists)
  *
  * The data from /proc/<pid>/cgroup looks (something) like:
  *  2:cpu:/bg_non_interactive
@@ -237,9 +158,9 @@ static void __init_cpuset(void) {
  * the default cgroup.  If the string is longer than "bufLen", the string
  * will be truncated.
  */
-static int getSchedulerGroup(int tid, char* buf, size_t bufLen)
+static int getCGroupSubsys(int tid, const char* subsys, char* buf, size_t bufLen)
 {
-#ifdef HAVE_ANDROID_OS
+#if defined(__ANDROID__)
     char pathBuf[32];
     char lineBuf[256];
     FILE *fp;
@@ -251,7 +172,7 @@ static int getSchedulerGroup(int tid, char* buf, size_t bufLen)
 
     while(fgets(lineBuf, sizeof(lineBuf) -1, fp)) {
         char *next = lineBuf;
-        char *subsys;
+        char *found_subsys;
         char *grp;
         size_t len;
 
@@ -260,11 +181,11 @@ static int getSchedulerGroup(int tid, char* buf, size_t bufLen)
             goto out_bad_data;
         }
 
-        if (!(subsys = strsep(&next, ":"))) {
+        if (!(found_subsys = strsep(&next, ":"))) {
             goto out_bad_data;
         }
 
-        if (strcmp(subsys, "cpu")) {
+        if (strcmp(found_subsys, subsys)) {
             /* Not the subsys we're looking for */
             continue;
         }
@@ -285,11 +206,11 @@ static int getSchedulerGroup(int tid, char* buf, size_t bufLen)
         return 0;
     }
 
-    SLOGE("%s Failed to find cpu subsys", proc_name);
+    SLOGE("Failed to find subsys %s", subsys);
     fclose(fp);
     return -1;
  out_bad_data:
-    SLOGE("%s Bad cgroup data {%s}", proc_name, lineBuf);
+    SLOGE("Bad cgroup data {%s}", lineBuf);
     fclose(fp);
     return -1;
 #else
@@ -303,12 +224,27 @@ int get_sched_policy(int tid, SchedPolicy *policy)
     if (tid == 0) {
         tid = gettid();
     }
-
-    pthread_once(&sched_once, __init_sched);
+    pthread_once(&the_once, __initialize);
 
     if (__sys_supports_schedgroups) {
         char grpBuf[32];
-        if (getSchedulerGroup(tid, grpBuf, sizeof(grpBuf)) < 0)
+#ifdef USE_CPUSETS
+        if (getCGroupSubsys(tid, "cpuset", grpBuf, sizeof(grpBuf)) < 0)
+            return -1;
+        if (grpBuf[0] == '\0') {
+            *policy = SP_FOREGROUND;
+        } else if (!strcmp(grpBuf, "foreground")) {
+            *policy = SP_FOREGROUND;
+        } else if (!strcmp(grpBuf, "background")) {
+            *policy = SP_BACKGROUND;
+        } else if (!strcmp(grpBuf, "top-app")) {
+            *policy = SP_TOP_APP;
+        } else {
+            errno = ERANGE;
+            return -1;
+        }
+#else
+        if (getCGroupSubsys(tid, "cpu", grpBuf, sizeof(grpBuf)) < 0)
             return -1;
         if (grpBuf[0] == '\0') {
             *policy = SP_FOREGROUND;
@@ -318,6 +254,7 @@ int get_sched_policy(int tid, SchedPolicy *policy)
             errno = ERANGE;
             return -1;
         }
+#endif
     } else {
         int rc = sched_getscheduler(tid);
         if (rc < 0)
@@ -343,33 +280,41 @@ int set_cpuset_policy(int tid, SchedPolicy policy)
     if (tid == 0) {
         tid = gettid();
     }
-
-    pthread_once(&cpuset_once, __init_cpuset);
-
-    if (!__sys_supports_cpusets)
-        return set_sched_policy(tid, policy);
-
     policy = _policy(policy);
+    pthread_once(&the_once, __initialize);
 
-    int fd;
+    int fd = -1;
+    int boost_fd = -1;
     switch (policy) {
     case SP_BACKGROUND:
         fd = bg_cpuset_fd;
+        boost_fd = bg_schedboost_fd;
         break;
     case SP_FOREGROUND:
     case SP_AUDIO_APP:
     case SP_AUDIO_SYS:
         fd = fg_cpuset_fd;
+        boost_fd = fg_schedboost_fd;
+        break;
+    case SP_TOP_APP :
+        fd = ta_cpuset_fd;
+        boost_fd = fg_schedboost_fd;
         break;
     case SP_SYSTEM:
         fd = system_bg_cpuset_fd;
+        boost_fd = bg_schedboost_fd;
         break;
     default:
-        fd = -1;
+        boost_fd = fd = -1;
         break;
     }
 
-    if (add_tid_to_cpuset(tid, fd) != 0) {
+    if (add_tid_to_cgroup(tid, fd) != 0) {
+        if (errno != ESRCH && errno != ENOENT)
+            return -errno;
+    }
+
+    if (boost_fd > 0 && add_tid_to_cgroup(tid, boost_fd) != 0) {
         if (errno != ESRCH && errno != ENOENT)
             return -errno;
     }
@@ -384,8 +329,7 @@ int set_sched_policy(int tid, SchedPolicy policy)
         tid = gettid();
     }
     policy = _policy(policy);
-
-    pthread_once(&sched_once, __init_sched);
+    pthread_once(&the_once, __initialize);
 
 #if POLICY_DEBUG
     char statfile[64];
@@ -417,6 +361,7 @@ int set_sched_policy(int tid, SchedPolicy policy)
     case SP_FOREGROUND:
     case SP_AUDIO_APP:
     case SP_AUDIO_SYS:
+    case SP_TOP_APP:
         SLOGD("^^^ tid %d (%s)", tid, thread_name);
         break;
     case SP_SYSTEM:
@@ -437,6 +382,7 @@ int set_sched_policy(int tid, SchedPolicy policy)
         case SP_FOREGROUND:
         case SP_AUDIO_APP:
         case SP_AUDIO_SYS:
+        case SP_TOP_APP:
             fd = fg_cgroup_fd;
             break;
         default:
@@ -491,6 +437,7 @@ const char *get_sched_policy_name(SchedPolicy policy)
        [SP_SYSTEM]     = "  ",
        [SP_AUDIO_APP]  = "aa",
        [SP_AUDIO_SYS]  = "as",
+       [SP_TOP_APP]    = "ta",
     };
     if ((policy < SP_CNT) && (strings[policy] != NULL))
         return strings[policy];

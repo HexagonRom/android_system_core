@@ -19,9 +19,11 @@
 
 #include <sysutils/SocketListener.h>
 #include <log/log_read.h>
-#include "LogReader.h"
 
 char *log_strntok_r(char *s, size_t *len, char **saveptr, size_t *sublen);
+
+class LogBuffer;
+class LogReader;
 
 class LogKlog : public SocketListener {
     LogBuffer *logbuf;
@@ -43,7 +45,9 @@ public:
     int log(const char *buf, size_t len);
     void synchronize(const char *buf, size_t len);
 
+    bool isMonotonic() { return logbuf->isMonotonic(); }
     static void convertMonotonicToReal(log_time &real) { real += correction; }
+    static void convertRealToMonotonic(log_time &real) { real -= correction; }
 
 protected:
     void sniffTime(log_time &now, const char **buf, size_t len, bool reverse);
