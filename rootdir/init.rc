@@ -11,7 +11,11 @@ import /init.usb.configfs.rc
 import /init.${ro.zygote}.rc
 
 # Include CM's extra init file
+<<<<<<< HEAD
 import /init.hexagon.rc
+=======
+import /init.cm.rc
+>>>>>>> dfc284e92db931045b8c204019088e15b57fce1e
 
 
 on early-init
