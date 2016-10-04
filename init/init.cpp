@@ -180,11 +180,7 @@ static int wait_for_coldboot_done_action(const std::vector<std::string>& args) {
     // Any longer than 1s is an unreasonable length of time to delay booting.
     // If you're hitting this timeout, check that you didn't make your
     // sepolicy regular expressions too expensive (http://b/19899875).
-<<<<<<< HEAD
     if (wait_for_file(COLDBOOT_DONE, timeout)) {
-=======
-    if (wait_for_file(COLDBOOT_DONE, 5)) {
->>>>>>> dfc284e92db931045b8c204019088e15b57fce1e
         ERROR("Timed out waiting for %s\n", COLDBOOT_DONE);
     }
     NOTICE("Waiting for %s took %.2fs.\n", COLDBOOT_DONE, t.duration());
@@ -276,7 +272,6 @@ static int keychord_init_action(const std::vector<std::string>& args)
 
 static int console_init_action(const std::vector<std::string>& args)
 {
-<<<<<<< HEAD
     int fd = -1;
     std::string console = property_get("ro.boot.console");
     if (!console.empty()) {
@@ -291,14 +286,6 @@ static int console_init_action(const std::vector<std::string>& args)
         sleep(1);
         fd = open(console_name.c_str(), O_RDWR | O_CLOEXEC);
     }
-=======
-    std::string console = property_get("ro.boot.console");
-    if (!console.empty()) {
-        console_name = "/dev/" + console;
-    }
-
-    int fd = open(console_name.c_str(), O_RDWR | O_CLOEXEC);
->>>>>>> dfc284e92db931045b8c204019088e15b57fce1e
     if (fd >= 0)
         INFO("Console device located");
 #endif
@@ -344,7 +331,6 @@ static void import_kernel_nv(const std::string& key, const std::string& value, b
         property_set(android::base::StringPrintf("ro.kernel.%s", key.c_str()).c_str(), value.c_str());
         return;
     }
-<<<<<<< HEAD
 
     if (key == "qemu") {
         strlcpy(qemu, value.c_str(), sizeof(qemu));
@@ -356,19 +342,6 @@ static void import_kernel_nv(const std::string& key, const std::string& value, b
     }
 }
 
-=======
-
-    if (key == "qemu") {
-        strlcpy(qemu, value.c_str(), sizeof(qemu));
-    } else if (key == BOARD_CHARGING_CMDLINE_NAME) {
-        strlcpy(battchg_pause, value.c_str(), sizeof(battchg_pause));
-    } else if (android::base::StartsWith(key, "androidboot.")) {
-        property_set(android::base::StringPrintf("ro.boot.%s", key.c_str() + 12).c_str(),
-                     value.c_str());
-    }
-}
-
->>>>>>> dfc284e92db931045b8c204019088e15b57fce1e
 static void export_oem_lock_status() {
     if (property_get("ro.oem_unlock_supported") != "1") {
         return;

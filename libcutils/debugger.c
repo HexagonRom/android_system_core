@@ -76,7 +76,7 @@ static int make_dump_request(debugger_action_t action, pid_t tid, int timeout_se
 }
 
 int dump_backtrace_to_file(pid_t tid, int fd) {
-    // Kind of a hack;
+  // Kind of a hack;
   // Use a timeout of 5 seconds for a given native proc
   return dump_backtrace_to_file_timeout(tid, fd, 5);
 }

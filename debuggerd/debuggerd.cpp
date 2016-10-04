@@ -721,12 +721,8 @@ static void worker_process(int fd, debugger_request_t& request) {
 }
 
 static void monitor_worker_process(int child_pid, const debugger_request_t& request) {
-<<<<<<< HEAD
-    // set the timeout to 3 sec, for trace collection
+  // set the timeout to 3 sec, for trace collection
   struct timespec timeout = {.tv_sec = 3, .tv_nsec = 0 };
-=======
-  struct timespec timeout = {.tv_sec = 10, .tv_nsec = 0 };
->>>>>>> dfc284e92db931045b8c204019088e15b57fce1e
   if (should_attach_gdb(request)) {
     // If wait_for_gdb is enabled, set the timeout to something large.
     timeout.tv_sec = INT_MAX;
