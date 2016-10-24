@@ -183,6 +183,7 @@ static int wait_for_coldboot_done_action(const std::vector<std::string>& args) {
     if (wait_for_file(COLDBOOT_DONE, timeout)) {
         ERROR("Timed out waiting for %s\n", COLDBOOT_DONE);
     }
+
     NOTICE("Waiting for %s took %.2fs.\n", COLDBOOT_DONE, t.duration());
     return 0;
 }
