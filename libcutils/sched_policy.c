@@ -124,17 +124,22 @@ static void __initialize(void) {
         system_bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
         filename = "/dev/cpuset/top-app/tasks";
         ta_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+    }
 
 #ifdef USE_SCHEDBOOST
+    if (!access("/dev/stune/tasks", F_OK)) {
+        char* filename;
         filename = "/dev/stune/top-app/tasks";
         ta_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
         filename = "/dev/stune/foreground/tasks";
         fg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
         filename = "/dev/stune/background/tasks";
         bg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
-#endif
+        filename = "/dev/stune/system-background/tasks";
+        system_bg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
     }
-#endif
+#endif /* USE_SCHEDBOOST */
+#endif /* USE_CPUSETS */
 }
 
 /*
