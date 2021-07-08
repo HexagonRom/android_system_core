@@ -68,6 +68,7 @@ static int ta_cpuset_fd = -1; // special cpuset for top app
 static int bg_schedboost_fd = -1;
 static int fg_schedboost_fd = -1;
 static int ta_schedboost_fd = -1;
+static int system_bg_schedboost_fd = -1;
 
 #if defined(USE_CPUSETS) || defined(USE_SCHEDBOOST)
 /* Add tid to the scheduling group defined by the policy */
